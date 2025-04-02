@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Result;
-use rand::rng;
-use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::info;
@@ -156,7 +154,7 @@ impl WalletFile {
     }
 
     fn new_random() -> Self {
-        Self::new(SecretKeyMaterial(rng().random()))
+        Self::new(SecretKeyMaterial::new_random())
     }
 
     pub fn entropy(&self) -> WalletEntropy {

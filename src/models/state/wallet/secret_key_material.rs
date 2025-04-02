@@ -3,6 +3,7 @@ use bip39::Mnemonic;
 use itertools::Itertools;
 use num_traits::ConstZero;
 use num_traits::Zero;
+use rand::rng;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -67,6 +68,11 @@ pub enum ShamirSecretSharingError {
 }
 
 impl SecretKeyMaterial {
+    /// Generates a new [`SecretKeyMaterial`] using a cryptographically secure RNG.
+    pub fn new_random() -> SecretKeyMaterial {
+        SecretKeyMaterial(rng().random())
+    }
+
     /// Split the secret across n shares such that combining any t of them
     /// yields the secret again.
     ///
@@ -193,13 +199,11 @@ mod test {
     use super::*;
 
     mod phrase_conversion {
-        use rand::rng;
-
         use super::*;
 
         #[test]
         fn phrase_conversion_works() {
-            let wallet_secret = SecretKeyMaterial(rng().random());
+            let wallet_secret = SecretKeyMaterial::new_random();
             let phrase = wallet_secret.to_phrase();
             let wallet_again = SecretKeyMaterial::from_phrase(&phrase).unwrap();
             let phrase_again = wallet_again.to_phrase();
@@ -210,7 +214,7 @@ mod test {
 
         #[test]
         fn bad_phrase_conversion_fails() {
-            let wallet_secret = SecretKeyMaterial(rng().random());
+            let wallet_secret = SecretKeyMaterial::new_random();
             let mut phrase = wallet_secret.to_phrase();
             phrase.push("blank".to_string());
             assert!(SecretKeyMaterial::from_phrase(&phrase).is_err());
