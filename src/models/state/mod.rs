@@ -1864,8 +1864,15 @@ impl GlobalState {
 
                 self.set_new_tip_internal(block.clone()).await.unwrap();
                 info!("Updated state with block of height {block_height}.");
+
                 num_stored_blocks += 1;
                 predecessor = block;
+
+                // Periodically flush databases every 1000 blocks
+                if num_stored_blocks % 1000 == 0 {
+                    self.flush_databases().await?;
+                    info!("Flushed databases after {num_stored_blocks} blocks.");
+                }
             }
         }
 
