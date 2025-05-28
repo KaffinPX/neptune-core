@@ -1870,7 +1870,7 @@ impl GlobalState {
 
                 // Flush the databases periodically every 100 blocks to control memory consumption
                 // and prevent excessive RAM usage during the bootstrap process.
-                if num_stored_blocks % 100 == 0 {
+                if num_stored_blocks % 10 == 0 {
                     self.flush_databases().await?;
                     info!("Flushed databases after {num_stored_blocks} blocks.");
                 }
