@@ -1289,8 +1289,8 @@ impl WalletState {
         );
 
         for (key_type, derivation_index) in max_counters {
-            self.bump_derivation_counter(key_type, derivation_index)
-                .await;
+            // self.bump_derivation_counter(key_type, derivation_index)
+            //    .await;
         }
 
         recovered_outputs
