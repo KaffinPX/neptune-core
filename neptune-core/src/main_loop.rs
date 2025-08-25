@@ -830,6 +830,9 @@ impl MainLoopHandler {
                         if !stay_in_sync_mode {
                             info!("Exiting sync mode");
                             global_state_mut.net.sync_anchor = None;
+
+                            // Still ignoring potential errors because of potential cases of immediate disconnection.
+                            let _ = self.main_to_peer_broadcast_tx.send(MainToPeerTask::MakeTemplateDiscoveryRequest);
                             self.main_to_miner_tx.send(MainToMiner::StopSyncing);
                         }
                     }
@@ -933,6 +936,8 @@ impl MainLoopHandler {
                     if !stay_in_sync_mode {
                         info!("Exiting sync mode");
                         global_state_mut.net.sync_anchor = None;
+
+                        // TODO: Ask for latest templates...
                     }
                 }
             }

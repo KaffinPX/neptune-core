@@ -122,6 +122,9 @@ pub(crate) enum MainToPeerTask {
     /// Request peer list from connected peers
     MakePeerDiscoveryRequest,
 
+    /// Request template notifications from connected peers
+    MakeTemplateDiscoveryRequest,
+
     /// Request peers from a specific peer to get peers further away
     MakeSpecificPeerDiscoveryRequest(SocketAddr),
 
@@ -136,12 +139,13 @@ pub(crate) enum MainToPeerTask {
 }
 
 impl MainToPeerTask {
-    pub fn get_type(&self) -> String {
+    pub fn get_type(&self) -> &'static str {
         match self {
             MainToPeerTask::Block(_) => "block",
             MainToPeerTask::RequestBlockBatch(_) => "req block batch",
             MainToPeerTask::PeerSynchronizationTimeout(_) => "peer sync timeout",
             MainToPeerTask::MakePeerDiscoveryRequest => "make peer discovery req",
+            MainToPeerTask::MakeTemplateDiscoveryRequest => "make template discovery req",
             MainToPeerTask::MakeSpecificPeerDiscoveryRequest(_) => {
                 "make specific peer discovery req"
             }
@@ -150,7 +154,6 @@ impl MainToPeerTask {
             MainToPeerTask::DisconnectAll() => "disconnect all",
             MainToPeerTask::BlockProposalNotification(_) => "block proposal notification",
         }
-        .to_string()
     }
 }
 

@@ -454,6 +454,7 @@ pub(crate) enum PeerMessage {
     SyncChallenge(SyncChallenge),
     SyncChallengeResponse(Box<SyncChallengeResponse>),
 
+    BlockProposalNotificationRequest,
     BlockProposalNotification(BlockProposalNotification),
 
     BlockProposalRequest(BlockProposalRequest),
@@ -496,6 +497,7 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => "peer list resp",
             PeerMessage::Bye => "bye",
             PeerMessage::ConnectionStatus(_) => "connection status",
+            PeerMessage::BlockProposalNotificationRequest => "block proposal notification request",
             PeerMessage::BlockProposalNotification(_) => "block proposal notification",
             PeerMessage::BlockProposalRequest(_) => "block proposal request",
             PeerMessage::BlockProposal(_) => "block proposal",
@@ -523,6 +525,7 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => false,
             PeerMessage::Bye => false,
             PeerMessage::ConnectionStatus(_) => false,
+            PeerMessage::BlockProposalNotificationRequest => false,
             PeerMessage::BlockProposalNotification(_) => false,
             PeerMessage::BlockProposalRequest(_) => false,
             PeerMessage::BlockProposal(_) => false,
@@ -550,6 +553,7 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => false,
             PeerMessage::Bye => false,
             PeerMessage::ConnectionStatus(_) => false,
+            PeerMessage::BlockProposalNotificationRequest => true,
             PeerMessage::BlockProposalNotification(_) => true,
             PeerMessage::BlockProposalRequest(_) => true,
             PeerMessage::BlockProposal(_) => true,

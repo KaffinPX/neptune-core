@@ -1473,6 +1473,20 @@ impl PeerLoopHandler {
 
                 Ok(KEEP_CONNECTION_ALIVE)
             }
+            PeerMessage::BlockProposalNotificationRequest => {
+                if let Some(proposal) = self
+                    .global_state_lock
+                    .lock_guard()
+                    .await
+                    .mining_state
+                    .block_proposal
+                    .map(|proposal| proposal.into())
+                {
+                    peer.send(PeerMessage::BlockProposalNotification(proposal))
+                        .await?;
+                }
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
             PeerMessage::BlockProposalNotification(block_proposal_notification) => {
                 let verdict = self
                     .global_state_lock
@@ -1660,6 +1674,11 @@ impl PeerLoopHandler {
             }
             MainToPeerTask::MakePeerDiscoveryRequest => {
                 peer.send(PeerMessage::PeerListRequest).await?;
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
+            MainToPeerTask::MakeTemplateDiscoveryRequest => {
+                peer.send(PeerMessage::BlockProposalNotificationRequest)
+                    .await?;
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             MainToPeerTask::Disconnect(peer_address) => {
