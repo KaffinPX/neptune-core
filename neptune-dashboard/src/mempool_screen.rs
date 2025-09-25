@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use itertools::Itertools;
 use neptune_cash::application::rpc::auth;
-use neptune_cash::application::rpc::server::MempoolTransactionInfo;
-use neptune_cash::application::rpc::server::RPCClient;
+use neptune_cash::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
 use num_traits::CheckedSub;
 use ratatui::layout::Constraint;
 use ratatui::layout::Margin;
@@ -27,6 +26,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::dashboard_app::DashboardEvent;
 use super::screen::Screen;
+use crate::dashboard_rpc_client::DashboardRpcClient;
 
 const PAGE_SIZE: usize = 20;
 
@@ -37,7 +37,7 @@ pub struct MempoolScreen {
     bg: Color,
     in_focus: bool,
     data: Arc<std::sync::Mutex<Vec<MempoolTransactionInfo>>>,
-    server: Arc<RPCClient>,
+    server: Arc<DashboardRpcClient>,
     poll_task: Option<Arc<std::sync::Mutex<JoinHandle<()>>>>,
     escalatable_event: Arc<std::sync::Mutex<Option<DashboardEvent>>>,
     page_start: Arc<std::sync::Mutex<usize>>,
@@ -45,7 +45,7 @@ pub struct MempoolScreen {
 }
 
 impl MempoolScreen {
-    pub fn new(rpc_server: Arc<RPCClient>, token: auth::Token) -> Self {
+    pub fn new(rpc_server: Arc<DashboardRpcClient>, token: auth::Token) -> Self {
         MempoolScreen {
             active: false,
             fg: Color::Gray,
@@ -62,7 +62,7 @@ impl MempoolScreen {
 
     async fn run_polling_loop(
         page_start: Arc<std::sync::Mutex<usize>>,
-        rpc_client: Arc<RPCClient>,
+        rpc_client: Arc<DashboardRpcClient>,
         token: auth::Token,
         mempool_transaction_info: Arc<std::sync::Mutex<Vec<MempoolTransactionInfo>>>,
         escalatable_event_arc: Arc<std::sync::Mutex<Option<DashboardEvent>>>,
@@ -173,10 +173,8 @@ impl Widget for MempoolScreen {
         let header = vec![
             "id",
             "proof type",
-            "#inputs",
-            "#outputs",
-            "+ effect on balance",
-            "- effect on balance",
+            "#in",
+            "#out",
             "Δ balance",
             "fee",
             "synced",
@@ -204,8 +202,6 @@ impl Widget for MempoolScreen {
                     mptxi.proof_type.to_string(),
                     mptxi.num_inputs.to_string(),
                     mptxi.num_outputs.to_string(),
-                    mptxi.positive_balance_effect.to_string(),
-                    mptxi.negative_balance_effect.to_string(),
                     balance_delta.to_string(),
                     mptxi.fee.to_string(),
                     if mptxi.synced {

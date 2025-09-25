@@ -11,7 +11,6 @@ use itertools::Itertools;
 use neptune_cash::api::export::KeyType;
 use neptune_cash::application::config::network::Network;
 use neptune_cash::application::rpc::auth;
-use neptune_cash::application::rpc::server::RPCClient;
 use neptune_cash::state::wallet::address::SpendingKey;
 use ratatui::layout::Constraint;
 use ratatui::layout::Margin;
@@ -34,6 +33,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::dashboard_app::DashboardEvent;
 use super::screen::Screen;
+use crate::dashboard_rpc_client::DashboardRpcClient;
 
 type AddressUpdate = SpendingKey;
 type AddressUpdateArc = Arc<std::sync::Mutex<Vec<AddressUpdate>>>;
@@ -111,7 +111,7 @@ pub struct AddressScreen {
     bg: Color,
     in_focus: bool,
     data: AddressUpdateArc,
-    server: Arc<RPCClient>,
+    server: Arc<DashboardRpcClient>,
     poll_task: Option<JoinHandleArc>,
     escalatable_event: DashboardEventArc,
     events: Events,
@@ -120,7 +120,7 @@ pub struct AddressScreen {
 }
 
 impl AddressScreen {
-    pub fn new(rpc_server: Arc<RPCClient>, network: Network, token: auth::Token) -> Self {
+    pub fn new(rpc_server: Arc<DashboardRpcClient>, network: Network, token: auth::Token) -> Self {
         let data = Arc::new(Mutex::new(vec![]));
         AddressScreen {
             active: false,
@@ -138,7 +138,7 @@ impl AddressScreen {
     }
 
     async fn run_polling_loop(
-        rpc_client: Arc<RPCClient>,
+        rpc_client: Arc<DashboardRpcClient>,
         token: auth::Token,
         address_updates: AddressUpdateArc,
         escalatable_event: DashboardEventArc,

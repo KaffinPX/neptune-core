@@ -103,15 +103,6 @@ impl GetSize for Utxo {
     }
 }
 
-impl From<(Digest, Vec<Coin>)> for Utxo {
-    fn from((lock_script_hash, coins): (Digest, Vec<Coin>)) -> Self {
-        Self {
-            lock_script_hash,
-            coins,
-        }
-    }
-}
-
 impl Utxo {
     pub fn new(lock_script_hash: Digest, coins: Vec<Coin>) -> Self {
         Self {
@@ -133,6 +124,24 @@ impl Utxo {
             coins: vec![Coin::new_native_currency(amount)],
             lock_script_hash,
         }
+    }
+
+    /// Add to the amount of the UTXO with a delta.
+    pub(crate) fn add_to_amount(mut self, delta: NativeCurrencyAmount) -> Self {
+        let current_amount = self.get_native_currency_amount();
+        let new_amount = current_amount + delta;
+        let new_amount = Coin::new_native_currency(new_amount);
+        let remove = self
+            .coins
+            .iter()
+            .find_position(|coin| coin.type_script_hash == NativeCurrency.hash());
+        if let Some((idx, _)) = remove {
+            self.coins[idx] = new_amount;
+        } else {
+            self.coins.push(new_amount);
+        };
+
+        self
     }
 
     pub fn has_native_currency(&self) -> bool {
@@ -238,7 +247,6 @@ impl Utxo {
 
     /// Determine whether there is a time-lock, with any release date, on the
     /// UTXO.
-    #[cfg(test)]
     pub(crate) fn is_timelocked(&self) -> bool {
         self.coins
             .iter()
@@ -258,10 +266,10 @@ impl StdHash for Utxo {
 
 impl Distribution<Utxo> for StandardUniform {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Utxo {
-        Utxo::from((
+        Utxo::new(
             rng.random(),
             NativeCurrencyAmount::coins(rng.next_u32() % 42000000).to_native_coins(),
-        ))
+        )
     }
 }
 
@@ -281,7 +289,7 @@ pub mod neptune_arbitrary {
                 type_script_hash,
                 state: amount.encode(),
             }];
-            Ok((lock_script_hash, coins).into())
+            Ok(Utxo::new(lock_script_hash, coins))
         }
     }
 }
@@ -289,13 +297,13 @@ pub mod neptune_arbitrary {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::protocol::consensus::transaction::lock_script::LockScript;
     use proptest::prelude::*;
     use proptest_arbitrary_interop::arb;
     use test_strategy::proptest;
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::protocol::consensus::transaction::lock_script::LockScript;
     use crate::triton_vm::prelude::*;
 
     impl Utxo {

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-#[cfg(test)]
-use arbitrary::Arbitrary;
 use get_size2::GetSize;
 use itertools::Itertools;
 use num_traits::Zero;
@@ -19,7 +17,6 @@ use tasm_lib::twenty_first::util_types::mmr::mmr_trait::Mmr;
 
 use super::active_window::ActiveWindow;
 use super::addition_record::AdditionRecord;
-
 use super::ms_membership_proof::MsMembershipProof;
 use super::removal_record::absolute_index_set::AbsoluteIndexSet;
 use super::removal_record::chunk::Chunk;
@@ -28,11 +25,10 @@ use super::removal_record::RemovalRecord;
 use super::shared::BATCH_SIZE;
 use super::shared::CHUNK_SIZE;
 use super::shared::WINDOW_SIZE;
-
 use crate::util_types::mutator_set::aocl_to_swbfi_leaf_counts;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, GetSize, BFieldCodec, TasmObject)]
-#[cfg_attr(test, derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "arbitrary-impls"), derive(arbitrary::Arbitrary))]
 pub struct MutatorSetAccumulator {
     pub aocl: MmrAccumulator,
     pub swbf_inactive: MmrAccumulator,
@@ -716,7 +712,7 @@ mod tests {
         let mut items: Vec<Digest> = vec![];
 
         // Add N elements to the MS
-        let num_additions = 44;
+        let num_additions = 400;
         for _ in 0..num_additions {
             let (item, sender_randomness, receiver_preimage) = mock_item_and_randomnesses();
 
@@ -754,9 +750,39 @@ mod tests {
         }
 
         // Remove the entries with batch_remove
-        accumulator.batch_remove(
-            removal_records,
+        let mut accumulator_batch_remove = accumulator.clone();
+        let updated_chunks = accumulator_batch_remove.batch_remove(
+            removal_records.clone(),
             &mut membership_proofs.iter_mut().collect::<Vec<_>>(),
+        );
+
+        // Verify return value from batch-removal method: updated chunks must
+        // agree with chunks in membership proofs. If all membership proofs are
+        // valid, then this check verifies that the returned chunks are correct.
+        for (chk_idx, chunk) in &updated_chunks {
+            for msmp in &membership_proofs {
+                for (chidx, (_, chnk)) in &msmp.target_chunks.dictionary {
+                    if *chidx == *chk_idx {
+                        assert_eq!(chunk, chnk);
+                    }
+                }
+            }
+        }
+
+        // Remove the entries one-by-one
+        let mut accumulator_individual_remove = accumulator;
+        while let Some(rr) = removal_records.pop() {
+            RemovalRecord::batch_update_from_remove(
+                &mut removal_records.iter_mut().collect_vec(),
+                &rr,
+            );
+
+            accumulator_individual_remove.remove(&rr);
+        }
+
+        assert_eq!(
+            accumulator_individual_remove, accumulator_batch_remove,
+            "Mutator sets must agree regardless of removal method"
         );
 
         // Verify that the expected membership proofs fail/pass
@@ -766,7 +792,7 @@ mod tests {
             skipped_removes.into_iter()
         ) {
             // If this removal record was not applied, then the membership proof must verify
-            assert_eq!(skipped, accumulator.verify(item, mp));
+            assert_eq!(skipped, accumulator_individual_remove.verify(item, mp));
         }
     }
 
@@ -994,7 +1020,8 @@ mod tests {
                 ) {
                     assert!(accumulator.verify(item, mp_batch));
 
-                    // Verify that the membership proof can be restored from an archival instance
+                    // Verify that the membership proof can be restored from an archival instance,
+                    // both without and with privacy.
                     let arch_mp = archival_after_remove
                         .restore_membership_proof(
                             item,
@@ -1004,6 +1031,17 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    let arch_mp_alt = archival_after_remove
+                        .restore_membership_proof_privacy_preserving(arch_mp.compute_indices(item))
+                        .await
+                        .unwrap()
+                        .extract_ms_membership_proof(
+                            mp_batch.aocl_leaf_index,
+                            sender_randomness,
+                            receiver_preimage,
+                        )
+                        .unwrap();
+                    assert_eq!(arch_mp, arch_mp_alt);
                     assert_eq!(arch_mp, mp_batch.to_owned());
 
                     // Verify that sequential and batch update produces the same membership proofs

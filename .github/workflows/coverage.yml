@@ -17,9 +17,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2025-05-18 # date is temporary – see issue #600
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -33,7 +32,7 @@ jobs:
       # at all, documentation tests are skipped.
       - name: Collect coverage data (skip doctests & benchmarks)
         run: >
-          cargo llvm-cov nextest
+          cargo +nightly llvm-cov nextest
           --lib --bins --tests --examples
           --lcov --output-path lcov.info
           --
@@ -42,6 +41,7 @@ jobs:
           --skip blocks_with_0_to_10_inputs_and_successors_are_valid
           --skip can_cancel_preprocess_within_one_second
           --skip can_cancel_merkle_tree_construction_within_two_seconds
+          --skip alice_updates_mutator_set_data_on_own_transaction
 
       - name: Upload coverage to coveralls.io
         uses: coverallsapp/github-action@v2

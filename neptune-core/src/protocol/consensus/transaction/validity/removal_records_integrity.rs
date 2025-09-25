@@ -1060,7 +1060,6 @@ mod tests {
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
     use crate::util_types::mutator_set::addition_record::AdditionRecord;
     use crate::util_types::mutator_set::commit;
-
     use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
     use crate::util_types::mutator_set::shared::NUM_TRIALS;
 
@@ -1394,7 +1393,7 @@ mod tests {
         // ensure entire data structure is hashed and compared. Missing just one
         // word in the hashing would make this snippet (and the entire
         // blockchain) unsound.
-        let original_minimum = bad_inputs[mutated_input].absolute_indices.get_minimum();
+        let original_minimum = bad_inputs[mutated_input].absolute_indices.minimum();
         for term in [1, 1 << 32, 1 << 64, 1 << 96] {
             bad_inputs[mutated_input]
                 .absolute_indices

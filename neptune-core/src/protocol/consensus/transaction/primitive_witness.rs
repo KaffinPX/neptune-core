@@ -15,7 +15,6 @@ use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tracing::warn;
 
-use super::lock_script::LockScript;
 use super::lock_script::LockScriptAndWitness;
 use super::transaction_kernel::TransactionKernel;
 use super::transaction_kernel::TransactionKernelModifier;
@@ -281,7 +280,7 @@ impl PrimitiveWitness {
             if let Err(_e) = run_res {
                 // tbd: should we include the VMerror in InvalidLockScript error?
                 let error = WitnessValidationError::InvalidLockScript(
-                    LockScript::from(lock_script_and_witness).hash(),
+                    lock_script_and_witness.program.hash(),
                 );
                 warn!("{}", error);
                 return Err(error);
@@ -693,7 +692,6 @@ pub mod neptune_arbitrary {
                         let fee = total_amount.checked_sub(&total_outputs).unwrap();
                         let total_inputs = input_utxos
                             .iter()
-                            .cloned()
                             .map(|utxo| utxo.get_native_currency_amount())
                             .sum::<NativeCurrencyAmount>();
 
@@ -1091,6 +1089,7 @@ mod tests {
     use crate::protocol::consensus::block::Block;
     use crate::protocol::consensus::block::MINING_REWARD_TIME_LOCK_PERIOD;
     use crate::protocol::consensus::transaction::announcement::Announcement;
+    use crate::protocol::consensus::transaction::lock_script::LockScript;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
     use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
     use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
@@ -1131,7 +1130,8 @@ mod tests {
             } else {
                 coins.push(new_coin);
             }
-            (self.lock_script_hash(), coins).into()
+
+            Utxo::new(self.lock_script_hash(), coins)
         }
     }
 
@@ -1504,7 +1504,7 @@ mod tests {
                             .into_iter()
                             .zip(lock_script_hashes)
                             .map(|(amount, lock_script_hash)| {
-                                Utxo::from((lock_script_hash, amount.to_native_coins()))
+                                Utxo::new(lock_script_hash, amount.to_native_coins())
                             })
                             .collect_vec();
 

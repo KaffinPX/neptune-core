@@ -112,14 +112,13 @@ mod test {
     use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::triton_vm::vm::NonDeterminism;
 
+    use super::GetTotalAndTimeLockedAmounts;
     use crate::api::export::NativeCurrencyAmount;
     use crate::api::export::Timestamp;
     use crate::protocol::consensus::transaction::utxo::Coin;
     use crate::protocol::consensus::transaction::utxo::Utxo;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
     use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
-
-    use super::GetTotalAndTimeLockedAmounts;
 
     impl Algorithm for GetTotalAndTimeLockedAmounts {
         fn rust_shadow(
@@ -193,7 +192,7 @@ mod test {
                     if i == bit || rng.random_bool(0.5) {
                         coins.push(TimeLock::until(rng.random()));
                     }
-                    Utxo::from((rng.random(), coins))
+                    Utxo::new(rng.random(), coins)
                 })
                 .collect_vec();
 

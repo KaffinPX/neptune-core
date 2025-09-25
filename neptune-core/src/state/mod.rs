@@ -91,6 +91,7 @@ use crate::state::mining::block_proposal::BlockProposalRejectError;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::expected_utxo::UtxoNotifier;
 use crate::state::wallet::monitored_utxo::MonitoredUtxo;
+use crate::state::wallet::sent_transaction::SentTransaction;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::wallet_state::IncomingUtxoRecoveryData;
 use crate::time_fn_call_async;
@@ -340,7 +341,7 @@ impl GlobalStateLock {
         // can group inputs and outputs together, eg for history purposes.
         let tip_digest = gsm.chain.light_state().hash();
         gsm.wallet_state
-            .add_sent_transaction((details.as_ref(), tip_digest).into())
+            .add_sent_transaction(SentTransaction::new(details.as_ref(), tip_digest))
             .await;
 
         // insert transaction into mempool
@@ -800,16 +801,20 @@ impl GlobalState {
     ///  - If `next_block_height` is genesis.
     pub(crate) fn composer_parameters(&self, next_block_height: BlockHeight) -> ComposerParameters {
         assert!(!next_block_height.is_genesis());
+
+        let coinbase_distribution = self.mining_state.overridden_coinbase_distribution();
+
         self.wallet_state.composer_parameters(
             next_block_height,
             self.cli.guesser_fraction,
             self.cli.fee_notification,
+            coinbase_distribution,
         )
     }
 
     /// Returns true iff the incoming block proposal is more favorable than the
-    /// one we're currently working on. Returns false if client is a composer,
-    /// as it's assumed that they prefer guessing on their own block.
+    /// one we're currently working on. Returns false if peer is either not
+    /// whitelisted, or if all foreign block proposals should be rejected.
     ///
     /// Favor [`Self::favor_incoming_block_proposal`] whenever the digests are
     /// available, as this function can return false positives in case of a
@@ -819,10 +824,6 @@ impl GlobalState {
         incoming_block_height: BlockHeight,
         incoming_guesser_fee: NativeCurrencyAmount,
     ) -> Result<(), BlockProposalRejectError> {
-        if self.cli().compose {
-            return Err(BlockProposalRejectError::Composing);
-        }
-
         let expected_height = self.chain.light_state().header().height.next();
         if incoming_block_height != expected_height {
             return Err(BlockProposalRejectError::WrongHeight {
@@ -831,8 +832,13 @@ impl GlobalState {
             });
         }
 
+        if self.mining_state.block_proposal.has_own() {
+            return Err(BlockProposalRejectError::HasOwnBlockProposal);
+        }
+
         let maybe_existing_fee = self.mining_state.block_proposal.map(|x| {
-            x.total_guesser_reward()
+            x.body()
+                .total_guesser_reward()
                 .expect("block in state must be valid")
         });
         if maybe_existing_fee.is_some_and(|current| current >= incoming_guesser_fee)
@@ -848,17 +854,13 @@ impl GlobalState {
     }
 
     /// Returns true iff the incoming block proposal is more favorable than the
-    /// one we're currently working on. Returns false if client is a composer,
-    /// as it's assumed that they prefer guessing on their own block.
+    /// one we're currently working on. Returns false if block proposal does not
+    /// have expected parent.
     pub(crate) fn favor_incoming_block_proposal(
         &self,
         incoming_proposal_prev_block_digest: Digest,
         incoming_guesser_fee: NativeCurrencyAmount,
     ) -> Result<(), BlockProposalRejectError> {
-        if self.cli().compose {
-            return Err(BlockProposalRejectError::Composing);
-        }
-
         let current_tip_digest = self.chain.light_state().hash();
         if incoming_proposal_prev_block_digest != current_tip_digest {
             return Err(BlockProposalRejectError::WrongParent {
@@ -867,8 +869,13 @@ impl GlobalState {
             });
         }
 
+        if self.mining_state.block_proposal.has_own() {
+            return Err(BlockProposalRejectError::HasOwnBlockProposal);
+        }
+
         let maybe_existing_fee = self.mining_state.block_proposal.map(|x| {
-            x.total_guesser_reward()
+            x.body()
+                .total_guesser_reward()
                 .expect("block in state must be valid")
         });
         if maybe_existing_fee.is_some_and(|current| current >= incoming_guesser_fee)
@@ -900,6 +907,7 @@ impl GlobalState {
             MiningStatus::Guessing(guessing_work_info) => {
                 let old_guesser_reward = guessing_work_info.total_guesser_fee;
                 let new_guesser_reward = new_proposal
+                    .body()
                     .total_guesser_reward()
                     .expect("New proposal must be valid");
                 let Some(delta) = new_guesser_reward.checked_sub(&old_guesser_reward) else {
@@ -1721,6 +1729,10 @@ impl GlobalState {
     /// not canonical that there is a connecting path. Assumes furthermore that
     /// the node is archival. If any of these assumptions are not met then this
     /// function returns an error.
+    ///
+    /// # Panics
+    ///
+    /// - If the stored block is found but does not have a mutator set update.
     pub(crate) async fn set_tip_to_stored_block(&mut self, block_digest: Digest) -> Result<()> {
         // If the node not archival, it cannot sync the wallet. So in this case,
         // abort early.
@@ -1736,11 +1748,6 @@ impl GlobalState {
             .get_block(block_digest)
             .await?
             .ok_or(anyhow::Error::msg(format!("unknown block {block_digest}")))?;
-
-        // Abort early if the block does not have a mutator set update.
-        if block.mutator_set_update().is_err() {
-            bail!("block does not have a mutator set update".to_string(),);
-        }
 
         let _ = self.set_new_tip_internal(block).await?;
 
@@ -1785,6 +1792,10 @@ impl GlobalState {
     /// be known.
     ///
     /// Returns a list of update-jobs that should be performed by this client.
+    ///
+    /// # Panics
+    ///
+    /// - If the new tip does not have a mutator set update.
     async fn set_new_tip_internal(&mut self, new_tip: Block) -> Result<Vec<MempoolUpdateJob>> {
         crate::macros::log_scope_duration!();
 
@@ -2383,11 +2394,10 @@ mod tests {
 
         use futures::future;
 
+        use super::*;
         use crate::api::export::TransactionProof;
         use crate::api::tx_initiation::builder::transaction_details_builder::TransactionDetailsBuilder;
         use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
-
-        use super::*;
 
         /// Create 3 branches and return them in an array.
         ///
@@ -2865,9 +2875,7 @@ mod tests {
         let wallet_status_1 = alice_gsl.get_wallet_status_for_tip().await;
         let timestamp_1 = current_block.header().timestamp;
         assert_eq!(
-            alice_gsl
-                .wallet_state
-                .confirmed_available_balance(&wallet_status_1, timestamp_1),
+            wallet_status_1.available_confirmed(timestamp_1),
             LIQUID_BLOCK_SUBSIDY.scalar_mul(3)
         );
 
@@ -2888,9 +2896,7 @@ mod tests {
         current_block = a_blocks.last().unwrap().clone();
         let wallet_status_2 = alice_gsl.get_wallet_status_for_tip().await;
         let timestamp_2 = current_block.header().timestamp;
-        let alice_balance_2 = alice_gsl
-            .wallet_state
-            .confirmed_available_balance(&wallet_status_2, timestamp_2);
+        let alice_balance_2 = wallet_status_2.available_confirmed(timestamp_2);
         let expected_balance_2 = LIQUID_BLOCK_SUBSIDY.scalar_mul(3);
         assert_eq!(
             expected_balance_2, alice_balance_2,
@@ -2915,9 +2921,7 @@ mod tests {
 
         let wallet_status_3 = alice_gsl.get_wallet_status_for_tip().await;
         let timestamp_3 = current_block.header().timestamp;
-        let wallet_balance_3 = alice_gsl
-            .wallet_state
-            .confirmed_available_balance(&wallet_status_3, timestamp_3);
+        let wallet_balance_3 = wallet_status_3.available_confirmed(timestamp_3);
         let expected_branch_a_liquid_balance = (LIQUID_BLOCK_SUBSIDY.scalar_mul(3))
             .checked_sub(&NativeCurrencyAmount::coins(10))
             .unwrap();
@@ -2945,9 +2949,7 @@ mod tests {
         let timestamp_4 = current_block.header().timestamp;
         assert_eq!(
             expected_branch_a_liquid_balance,
-            alice_gsl
-                .wallet_state
-                .confirmed_available_balance(&wallet_status_4, timestamp_4),
+            wallet_status_4.available_confirmed(timestamp_4)
         );
 
         // resolve fork: apply all of branch b
@@ -2964,9 +2966,7 @@ mod tests {
             WalletStatusExportFormat::Table.export(&wallet_status_5)
         );
         let timestamp_5 = current_block.header().timestamp;
-        let wallet_balance_5 = alice_gsl
-            .wallet_state
-            .confirmed_available_balance(&wallet_status_5, timestamp_5);
+        let wallet_balance_5 = wallet_status_5.available_confirmed(timestamp_5);
         assert_eq!(
             wallet_balance_5,
             LIQUID_BLOCK_SUBSIDY.scalar_mul(3),
@@ -2991,9 +2991,7 @@ mod tests {
         let wallet_status_6 = alice_gsl.get_wallet_status_for_tip().await;
         let timestamp_6 = current_block.header().timestamp;
         assert_eq!(
-            alice_gsl
-                .wallet_state
-                .confirmed_available_balance(&wallet_status_6, timestamp_6),
+            wallet_status_6.available_confirmed(timestamp_6),
             (LIQUID_BLOCK_SUBSIDY.scalar_mul(3))
                 .checked_sub(&NativeCurrencyAmount::coins(5))
                 .unwrap()
@@ -3012,9 +3010,7 @@ mod tests {
         let timestamp_7 = current_block.header().timestamp;
         assert_eq!(
             expected_branch_a_liquid_balance,
-            alice_gsl
-                .wallet_state
-                .confirmed_available_balance(&wallet_status_7, timestamp_7),
+            wallet_status_7.available_confirmed(timestamp_7),
         );
 
         // Can set tip to genesis
@@ -3025,16 +3021,8 @@ mod tests {
             .unwrap();
         let wallet_status_8 = alice_gsl.get_wallet_status_for_tip().await;
         let timestamp_8 = genesis.header().timestamp;
-        assert!(alice_gsl
-            .wallet_state
-            .confirmed_available_balance(&wallet_status_8, timestamp_8)
-            .is_zero(),);
-        assert_eq!(
-            premine_amount,
-            alice_gsl
-                .wallet_state
-                .confirmed_total_balance(&wallet_status_8),
-        );
+        assert!(wallet_status_8.available_confirmed(timestamp_8).is_zero(),);
+        assert_eq!(premine_amount, wallet_status_8.total_confirmed());
         assert_eq!(alice_gsl.chain.light_state().hash(), genesis.hash());
 
         // State updates work when tip is genesis
@@ -3052,9 +3040,7 @@ mod tests {
         let timestamp_9 = current_block.header().timestamp;
         assert_eq!(
             expected_branch_a_liquid_balance,
-            alice_gsl
-                .wallet_state
-                .confirmed_available_balance(&wallet_status_9, timestamp_9),
+            wallet_status_9.available_confirmed(timestamp_9)
         );
 
         let expected_branch_a_total_balance = (LIQUID_BLOCK_SUBSIDY.scalar_mul(6))
@@ -3063,9 +3049,7 @@ mod tests {
             + premine_amount;
         assert_eq!(
             expected_branch_a_total_balance,
-            alice_gsl
-                .wallet_state
-                .confirmed_total_balance(&wallet_status_9),
+            wallet_status_9.total_confirmed()
         );
 
         // Set tip to genesis again, then to target some place on the a-chain.
@@ -3082,15 +3066,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 expected_branch_a_total_balance,
-                alice_gsl
-                    .wallet_state
-                    .confirmed_total_balance(&wallet_status_9),
+                wallet_status_9.total_confirmed()
             );
             assert_eq!(
                 expected_branch_a_liquid_balance,
-                alice_gsl
-                    .wallet_state
-                    .confirmed_available_balance(&wallet_status_9, timestamp_9),
+                wallet_status_9.available_confirmed(timestamp_9)
             );
         }
     }
@@ -3452,7 +3432,7 @@ mod tests {
                 assert!(!alice
                     .get_wallet_status_for_tip()
                     .await
-                    .synced_unspent_available_amount(launch + seven_months)
+                    .available_confirmed(launch + seven_months)
                     .is_zero());
                 assert!(!alice.get_balance_history().await.is_empty());
 
@@ -4084,7 +4064,7 @@ mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(in_seven_months)
+                .available_confirmed(in_seven_months)
         );
         assert_eq!(
             NativeCurrencyAmount::coins(7),
@@ -4092,7 +4072,7 @@ mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(in_seven_months)
+                .available_confirmed(in_seven_months)
         );
         // TODO: No idea why this isn't working. It's off by 1 NAU?
         // {
@@ -4295,9 +4275,8 @@ mod tests {
     }
 
     mod block_proposals {
-        use crate::tests::shared::blocks::invalid_empty_block1_with_guesser_fraction;
-
         use super::*;
+        use crate::tests::shared::blocks::invalid_empty_block1_with_guesser_fraction;
 
         #[apply(shared_tokio_runtime)]
         async fn dont_guess_when_block_proposal_not_known() {
@@ -4421,7 +4400,10 @@ mod tests {
                 state
                     .favor_incoming_block_proposal(
                         small_prev_block_digest,
-                        small_guesser_fraction.total_guesser_reward().unwrap()
+                        small_guesser_fraction
+                            .body()
+                            .total_guesser_reward()
+                            .unwrap()
                     )
                     .is_ok(),
                 "Must favor low guesser fee over none"
@@ -4433,7 +4415,7 @@ mod tests {
                 state
                     .favor_incoming_block_proposal(
                         big_prev_block_digest,
-                        big_guesser_fraction.total_guesser_reward().unwrap()
+                        big_guesser_fraction.body().total_guesser_reward().unwrap()
                     )
                     .is_ok(),
                 "Must favor big guesser fee over low"
@@ -4443,13 +4425,13 @@ mod tests {
                 BlockProposal::foreign_proposal(big_guesser_fraction.clone());
             assert_eq!(
                 BlockProposalRejectError::InsufficientFee {
-                    current: Some(big_guesser_fraction.total_guesser_reward().unwrap()),
-                    received: big_guesser_fraction.total_guesser_reward().unwrap()
+                    current: Some(big_guesser_fraction.body().total_guesser_reward().unwrap()),
+                    received: big_guesser_fraction.body().total_guesser_reward().unwrap()
                 },
                 state
                     .favor_incoming_block_proposal(
                         big_prev_block_digest,
-                        big_guesser_fraction.total_guesser_reward().unwrap()
+                        big_guesser_fraction.body().total_guesser_reward().unwrap()
                     )
                     .unwrap_err(),
                 "Must favor existing over incoming equivalent"
@@ -5287,7 +5269,7 @@ mod tests {
                     .await
                     .get_wallet_status_for_tip()
                     .await
-                    .synced_unspent_available_amount(seven_months_post_launch);
+                    .available_confirmed(seven_months_post_launch);
                 assert_eq!(alice_initial_balance, NativeCurrencyAmount::coins(20));
 
                 // create change key for alice. change_key_type is a test param.
@@ -5411,7 +5393,7 @@ mod tests {
                         .await
                         .get_wallet_status_for_tip()
                         .await
-                        .synced_unspent_available_amount(seven_months_post_launch)
+                        .available_confirmed(seven_months_post_launch)
                 );
 
                 block_1
@@ -5430,7 +5412,7 @@ mod tests {
                     bob_state_mut
                         .get_wallet_status_for_tip()
                         .await
-                        .synced_unspent_available_amount(seven_months_post_launch)
+                        .available_confirmed(seven_months_post_launch)
                 );
             }
 
@@ -5466,7 +5448,7 @@ mod tests {
                 let alice_initial_balance = alice_state_mut
                     .get_wallet_status_for_tip()
                     .await
-                    .synced_unspent_available_amount(seven_months_post_launch);
+                    .available_confirmed(seven_months_post_launch);
 
                 // lucky alice's wallet begins with 20 balance from premine.
                 assert_eq!(alice_initial_balance, NativeCurrencyAmount::coins(20));
@@ -5497,7 +5479,7 @@ mod tests {
                     alice_state_mut
                         .get_wallet_status_for_tip()
                         .await
-                        .synced_unspent_available_amount(seven_months_post_launch)
+                        .available_confirmed(seven_months_post_launch)
                 );
             }
         }

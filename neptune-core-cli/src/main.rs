@@ -1,3 +1,4 @@
+pub(crate) mod models;
 mod parser;
 
 use std::io;
@@ -16,7 +17,6 @@ use anyhow::ensure;
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
-use clap::Subcommand;
 use clap_complete::generate;
 use clap_complete::Shell;
 use itertools::Itertools;
@@ -25,6 +25,7 @@ use neptune_cash::api::tx_initiation::builder::tx_output_list_builder::OutputFor
 use neptune_cash::application::config::data_directory::DataDirectory;
 use neptune_cash::application::config::network::Network;
 use neptune_cash::application::rpc::auth;
+use neptune_cash::application::rpc::server::coinbase_output_readable::CoinbaseOutputReadable;
 use neptune_cash::application::rpc::server::error::RpcError;
 use neptune_cash::application::rpc::server::RPCClient;
 use neptune_cash::protocol::consensus::block::block_selector::BlockSelector;
@@ -42,46 +43,17 @@ use neptune_cash::state::wallet::wallet_status::WalletStatus;
 use neptune_cash::state::wallet::wallet_status::WalletStatusExportFormat;
 use rand::Rng;
 use regex::Regex;
-use serde::Deserialize;
-use serde::Serialize;
 use tarpc::client;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Json;
 
+use crate::models::claim_utxo::ClaimUtxoFormat;
+use crate::models::utxo_transfer_entry::UtxoTransferEntry;
 use crate::parser::beneficiary::Beneficiary;
 use crate::parser::hex_digest::HexDigest;
 
 const SELF: &str = "self";
 const ANONYMOUS: &str = "anonymous";
-
-/// represents data format of input to claim-utxo
-#[derive(Debug, Clone, Subcommand)]
-enum ClaimUtxoFormat {
-    /// reads a utxo-transfer json file
-    File {
-        /// path to the file
-        path: PathBuf,
-    },
-    Raw {
-        /// The encrypted UTXO notification payload.
-        ciphertext: String,
-    },
-}
-
-/// represents a UtxoTransfer entry in a utxo-transfer file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UtxoTransferEntry {
-    pub data_format: String,
-    pub recipient_abbrev: String,
-    pub recipient: String,
-    pub ciphertext: String,
-}
-
-impl UtxoTransferEntry {
-    fn data_format() -> String {
-        "neptune-utxo-transfer-v1.0".to_string()
-    }
-}
 
 #[derive(Debug, Clone, Parser)]
 enum Command {
@@ -330,6 +302,15 @@ enum Command {
 
     /// resume mining
     RestartMiner,
+
+    /// set coinbase distribution for the next locally produced block proposal
+    SetCoinbaseDistribution {
+        #[clap(long, value_parser)]
+        file: PathBuf,
+    },
+
+    /// Reset coinbase distribution to reward own wallet
+    UnsetCoinbaseDistribution,
 
     /// Set the tip of the blockchain state to a stored block, identified by its
     /// hash.
@@ -874,10 +855,10 @@ async fn main() -> Result<()> {
         }
         Command::Header { block_selector } => {
             let res = client.header(ctx, token, block_selector).await??;
-            if res.is_none() {
-                println!("Block did not exist in database.");
+            if let Some(res) = res {
+                println!("{res}");
             } else {
-                println!("{}", res.unwrap());
+                println!("Block did not exist in database.");
             }
         }
         Command::ConfirmedAvailableBalance => {
@@ -1289,6 +1270,19 @@ async fn main() -> Result<()> {
             println!("Sending command to restart miner.");
             client.restart_miner(ctx, token).await??;
             println!("Command completed successfully");
+        }
+        Command::SetCoinbaseDistribution { file } => {
+            let file = std::fs::read_to_string(file)?;
+            let coinbase_distribution: Vec<CoinbaseOutputReadable> = serde_json::from_str(&file)?;
+
+            client
+                .set_coinbase_distribution(ctx, token, coinbase_distribution)
+                .await??;
+            println!("Coinbase distribution sent to node");
+        }
+        Command::UnsetCoinbaseDistribution => {
+            client.unset_coinbase_distribution(ctx, token).await??;
+            println!("Coinbase distribution reset to own wallet");
         }
 
         Command::SetTip { digest } => {

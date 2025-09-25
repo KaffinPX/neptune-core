@@ -429,6 +429,13 @@ impl ArchivalState {
             };
             let mut mmap: memmap2::MmapMut = mmap.make_mut().unwrap();
             mmap.deref_mut()[..].copy_from_slice(&serialized_block);
+
+            // Flush the memory-mapped pages to the physical disk.
+            // This call will block until the data is safely persisted.
+            // This ensures block data is written to the blkXX.dat file before
+            // updating the DB.  Otherwise we can have situations where the DB
+            // references a block that does not exist on disk.
+            mmap.flush().unwrap();
         })
         .await?;
 
@@ -597,46 +604,45 @@ impl ArchivalState {
     }
 
     async fn get_block_from_block_record(&self, block_record: BlockRecord) -> Result<Block> {
-        // Get path of file for block
         let block_file_path: PathBuf = self
             .data_dir
             .block_file_path(block_record.file_location.file_index);
 
-        // Open file as read-only
-        let block_file: tokio::fs::File = match tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(block_file_path.clone())
-            .await
-        {
-            Ok(file) => file,
-            Err(e) => {
+        tokio::task::spawn_blocking(move || {
+            let block_file = std::fs::File::open(&block_file_path)?;
+
+            // 1. Get file metadata to find its actual size on disk.
+            let metadata = block_file.metadata()?;
+            let file_size = metadata.len();
+
+            // 2. validate that the requested slice is within the file's bounds.
+            // See: https://github.com/Neptune-Crypto/neptune-core/issues/471
+            let requested_end = block_record.file_location.offset
+                .saturating_add(block_record.file_location.block_length as u64);
+
+            if requested_end > file_size {
                 bail!(
-                    "Could not open block file {}: {e}",
-                    block_file_path.as_path().to_string_lossy()
+                    "Data corruption: Attempted to read beyond end of file '{}'. (Size: {}, Requested End: {})",
+                    block_file_path.display(), file_size, requested_end
                 );
             }
-        };
 
-        // Read the file into memory, set the offset and length indicated in the block record
-        // to avoid using more memory than needed
-        // we use spawn_blocking to make the blocking mmap async-friendly.
-
-        tokio::task::spawn_blocking(move || {
+            // 3. The slice is valid, so we can safely memory-map it.
             let mmap = unsafe {
                 MmapOptions::new()
                     .offset(block_record.file_location.offset)
                     .len(block_record.file_location.block_length)
                     .map(&block_file)?
             };
-            let block: Block = match bincode::deserialize(&mmap) {
-                Ok(b) => b,
-                Err(e) => {
-                    panic!("Could not deserialize block file into `Block`.\n\
-                            Block files may be corrupt, out of date, or incompatible with current version of neptune-core.\n\
-                            Error was: {e}");
-                }
-            };
-            Ok(block)
+
+            // 4. deserialize directly from the validated mmap slice.
+            bincode::deserialize(&mmap).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to deserialize block from file {}. Data may be corrupt or incompatible\
+                     with current version of neptune-core. Error: {}",
+                    block_file_path.display(), e
+                )
+            })
         })
         .await?
     }
@@ -1370,16 +1376,10 @@ impl ArchivalState {
             }
 
             // Remove items, thus removing the input UTXOs from the mutator set
-            while let Some(removal_record) = removals_mutable.pop() {
-                // Batch-update all removal records to keep them valid after next removal
-                RemovalRecord::batch_update_from_remove(&mut removals_mutable, removal_record);
-
-                // Remove the element from the mutator set
-                self.archival_mutator_set
-                    .ams_mut()
-                    .remove(removal_record)
-                    .await;
-            }
+            self.archival_mutator_set
+                .ams_mut()
+                .batch_remove(removals)
+                .await;
         }
 
         // Sanity check that archival mutator set has been updated consistently with the new block
@@ -1803,7 +1803,7 @@ pub(super) mod tests {
         );
 
         assert_eq!(
-            num_premine_utxos + block_1b.guesser_fee_utxos().unwrap().len(),
+            num_premine_utxos + block_1b.kernel.guesser_fee_utxos().unwrap().len(),
             alice
                 .lock_guard()
                 .await
@@ -2238,7 +2238,7 @@ pub(super) mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(in_seven_months)
+                .available_confirmed(in_seven_months)
         );
         assert_eq!(
             NativeCurrencyAmount::coins(5),
@@ -2246,7 +2246,7 @@ pub(super) mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(in_seven_months)
+                .available_confirmed(in_seven_months)
         );
 
         let block_subsidy = Block::block_subsidy(block_1.header().height);
@@ -2263,7 +2263,7 @@ pub(super) mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(in_seven_months)
+                .available_confirmed(in_seven_months)
         );
 
         let after_cb_timelock_expiration = block_1.header().timestamp + Timestamp::months(37);
@@ -2274,7 +2274,7 @@ pub(super) mod tests {
                 .await
                 .get_wallet_status_for_tip()
                 .await
-                .synced_unspent_available_amount(after_cb_timelock_expiration)
+                .available_confirmed(after_cb_timelock_expiration)
         );
 
         println!("Transactions were received in good order.");
@@ -2461,14 +2461,14 @@ pub(super) mod tests {
             .await
             .get_wallet_status_for_tip()
             .await
-            .synced_unspent_available_amount(in_seven_months)
+            .available_confirmed(in_seven_months)
             .is_zero());
         assert!(bob
             .lock_guard()
             .await
             .get_wallet_status_for_tip()
             .await
-            .synced_unspent_available_amount(in_seven_months)
+            .available_confirmed(in_seven_months)
             .is_zero());
 
         // Verify that all ingoing UTXOs are recorded in wallet of receiver of genesis UTXO

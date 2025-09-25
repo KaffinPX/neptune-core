@@ -15,7 +15,6 @@ use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembership
 use triton_vm::prelude::Digest;
 
 use super::chunk::Chunk;
-
 use crate::prelude::triton_vm;
 
 type AuthenticatedChunk = (MmrMembershipProof, Chunk);
@@ -44,6 +43,7 @@ impl ChunkDictionary {
         dictionary.sort_by_key(|(k, _v)| *k);
         Self { dictionary }
     }
+
     pub fn indices_and_leafs(&self) -> Vec<(ChunkIndex, Digest)> {
         self.dictionary
             .iter()

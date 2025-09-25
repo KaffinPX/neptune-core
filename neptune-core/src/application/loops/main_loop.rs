@@ -3,6 +3,8 @@ pub(crate) mod upgrade_incentive;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -13,6 +15,7 @@ use proof_upgrader::get_upgrade_task_from_mempool;
 use proof_upgrader::UpgradeJob;
 use rand::prelude::IteratorRandom;
 use rand::seq::IndexedRandom;
+use tasm_lib::prelude::Digest;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal;
@@ -627,6 +630,40 @@ impl MainLoopHandler {
         self.main_to_miner_tx.send(MainToMiner::Continue);
     }
 
+    /// Invoke the external program that runs whenever the tip changes, if one
+    /// such is set.
+    ///
+    /// Halts the entire application if the declared program could not be
+    /// started but does not wait for the program to finish and does thus not
+    /// check the exit code of the spawned process. Programs are guaranteed to
+    /// spawned in the order that the new tips are set. So in the case of a
+    /// reorganization, the block height will fall compared to the previous
+    /// invocation.
+    fn spawn_block_notify_command(block_notify: &Option<String>, block_hash: Digest) {
+        if let Some(block_notify) = block_notify {
+            let cmd = block_notify.to_owned();
+            let cmd = cmd.replace("%s", &block_hash.to_hex());
+
+            debug!("Invoking block notify cmd:\"{cmd}\"");
+            let args = cmd.split(' ').collect_vec();
+            trace!("args[0]=\"{}\"", args[0]);
+            trace!("args[1..]=[{}]", args[1..].iter().join(","));
+            let child = Command::new(args[0])
+                .args(&args[1..])
+                .stdin(Stdio::null()) // detach from our stdin
+                .stdout(Stdio::null()) // discard output
+                .stderr(Stdio::null()) // discard errors
+                .spawn()
+                .unwrap_or_else(|e| {
+                    error!("Failed to start external program \"{cmd}\": {e}");
+                    std::process::exit(1);
+                });
+
+            // Don't wait on `child`, just drop it:
+            drop(child);
+        }
+    }
+
     /// Process a block whose PoW solution was solved by this client (or an
     /// external program) and has not been seen by the rest of the network yet.
     ///
@@ -676,6 +713,11 @@ impl MainLoopHandler {
         // Share block with peers right away.
         let pmsg = MainToPeerTask::Block(new_block);
         self.main_to_peer_broadcast(pmsg);
+
+        Self::spawn_block_notify_command(
+            &self.global_state_lock.cli().block_notify,
+            new_block_hash,
+        );
 
         info!("Locally-mined block is new tip: {new_block_hash:x}");
         info!("broadcasting new block to peers");
@@ -773,16 +815,17 @@ impl MainLoopHandler {
         main_loop_state: &mut MutableMainLoopState,
     ) -> Result<()> {
         debug!("Received {} from a peer task", msg.get_type());
-        let cli_args = self.global_state_lock.cli().clone();
         match msg {
             PeerTaskToMain::NewBlocks(blocks) => {
                 log_slow_scope!(fn_name!() + "::PeerTaskToMain::NewBlocks");
 
+                let block_hashes = blocks.iter().map(|x| x.hash()).collect_vec();
                 let last_block = blocks.last().unwrap().to_owned();
                 let update_jobs = {
                     // The peer tasks also check this condition, if block is more canonical than current
                     // tip, but we have to check it again since the block update might have already been applied
                     // through a message from another peer (or from own miner).
+                    let sync_mode_threshold = self.global_state_lock.cli().sync_mode_threshold;
                     let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
                     let new_canonical =
                         global_state_mut.incoming_block_is_more_canonical(&last_block);
@@ -830,7 +873,7 @@ impl MainLoopHandler {
                         let stay_in_sync_mode = stay_in_sync_mode(
                             &last_block.kernel.header,
                             &main_loop_state.sync_state,
-                            cli_args.sync_mode_threshold,
+                            sync_mode_threshold,
                         );
                         if !stay_in_sync_mode {
                             info!("Exiting sync mode");
@@ -858,6 +901,7 @@ impl MainLoopHandler {
                         // test for a test of this phenomenon.
 
                         let update_jobs_ = global_state_mut.set_new_tip(new_block).await?;
+
                         update_jobs.extend(update_jobs_);
                     }
 
@@ -869,6 +913,13 @@ impl MainLoopHandler {
                 // Inform all peers about new block
                 let pmsg = MainToPeerTask::Block(Box::new(last_block.clone()));
                 self.main_to_peer_broadcast(pmsg);
+
+                for block_hash in block_hashes {
+                    Self::spawn_block_notify_command(
+                        &self.global_state_lock.cli().block_notify,
+                        block_hash,
+                    );
+                }
 
                 // Spawn task to handle mempool tx-updating after new blocks.
                 // TODO: Do clever trick to collapse all jobs relating to the same transaction,
@@ -927,13 +978,14 @@ impl MainLoopHandler {
                     .remove(&socket_addr);
 
                 // Get out of sync mode if needed.
+                let sync_mode_threshold = self.global_state_lock.cli().sync_mode_threshold;
                 let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
 
                 if global_state_mut.net.sync_anchor.is_some() {
                     let stay_in_sync_mode = stay_in_sync_mode(
                         global_state_mut.chain.light_state().header(),
                         &main_loop_state.sync_state,
-                        cli_args.sync_mode_threshold,
+                        sync_mode_threshold,
                     );
                     if !stay_in_sync_mode {
                         info!("Exiting sync mode");
@@ -1012,6 +1064,7 @@ impl MainLoopHandler {
                     let verdict = global_state_mut.favor_incoming_block_proposal(
                         block.header().prev_block_digest,
                         block
+                            .body()
                             .total_guesser_reward()
                             .expect("block received by main loop must have guesser reward"),
                     );
@@ -1177,19 +1230,17 @@ impl MainLoopHandler {
             let global_state_lock = self.global_state_lock.clone();
             let main_to_peer_broadcast_rx = self.main_to_peer_broadcast_tx.subscribe();
             let peer_task_to_main_tx = self.peer_task_to_main_tx.to_owned();
-            let outgoing_connection_task = tokio::task::Builder::new()
-                .name("call_peer_wrapper_1")
-                .spawn(async move {
-                    call_peer(
-                        peer_with_lost_connection,
-                        global_state_lock,
-                        main_to_peer_broadcast_rx,
-                        peer_task_to_main_tx,
-                        own_handshake_data,
-                        1, // All CLI-specified peers have distance 1
-                    )
-                    .await;
-                })?;
+            let outgoing_connection_task = tokio::task::spawn(async move {
+                call_peer(
+                    peer_with_lost_connection,
+                    global_state_lock,
+                    main_to_peer_broadcast_rx,
+                    peer_task_to_main_tx,
+                    own_handshake_data,
+                    1, // All CLI-specified peers have distance 1
+                )
+                .await;
+            });
             main_loop_state.task_handles.push(outgoing_connection_task);
             main_loop_state.task_handles.retain(|th| !th.is_finished());
         }
@@ -1250,19 +1301,17 @@ impl MainLoopHandler {
         let global_state_lock = self.global_state_lock.clone();
         let main_to_peer_broadcast_rx = self.main_to_peer_broadcast_tx.subscribe();
         let peer_task_to_main_tx = self.peer_task_to_main_tx.to_owned();
-        let outgoing_connection_task = tokio::task::Builder::new()
-            .name("call_peer_wrapper_2")
-            .spawn(async move {
-                call_peer(
-                    peer_candidate,
-                    global_state_lock,
-                    main_to_peer_broadcast_rx,
-                    peer_task_to_main_tx,
-                    own_handshake_data,
-                    candidate_distance,
-                )
-                .await;
-            })?;
+        let outgoing_connection_task = tokio::task::spawn(async move {
+            call_peer(
+                peer_candidate,
+                global_state_lock,
+                main_to_peer_broadcast_rx,
+                peer_task_to_main_tx,
+                own_handshake_data,
+                candidate_distance,
+            )
+            .await;
+        });
         main_loop_state.task_handles.push(outgoing_connection_task);
         main_loop_state.task_handles.retain(|th| !th.is_finished());
 
@@ -1490,18 +1539,15 @@ impl MainLoopHandler {
 
         let global_state_lock_clone = self.global_state_lock.clone();
         let main_to_peer_broadcast_tx_clone = self.main_to_peer_broadcast_tx.clone();
-        let proof_upgrader_task =
-            tokio::task::Builder::new()
-                .name("proof_upgrader")
-                .spawn(async move {
-                    upgrade_candidate
-                        .handle_upgrade(
-                            vm_job_queue,
-                            global_state_lock_clone,
-                            main_to_peer_broadcast_tx_clone,
-                        )
-                        .await
-                })?;
+        let proof_upgrader_task = tokio::task::spawn(async move {
+            upgrade_candidate
+                .handle_upgrade(
+                    vm_job_queue,
+                    global_state_lock_clone,
+                    main_to_peer_broadcast_tx_clone,
+                )
+                .await
+        });
 
         main_loop_state.proof_upgrader_task = Some(proof_upgrader_task);
 
@@ -1533,21 +1579,16 @@ impl MainLoopHandler {
             .cli()
             .proof_job_options(TritonVmJobPriority::Highest);
         let global_state_lock = self.global_state_lock.clone();
-        main_loop_state.update_mempool_txs_handle = Some(
-            tokio::task::Builder::new()
-                .name("mempool tx ms-updater")
-                .spawn(async move {
-                    Self::update_mempool_jobs(
-                        global_state_lock,
-                        update_jobs,
-                        vm_job_queue.clone(),
-                        update_sender,
-                        job_options,
-                    )
-                    .await
-                })
-                .unwrap(),
-        );
+        main_loop_state.update_mempool_txs_handle = Some(tokio::task::spawn(async move {
+            Self::update_mempool_jobs(
+                global_state_lock,
+                update_jobs,
+                vm_job_queue.clone(),
+                update_sender,
+                job_options,
+            )
+            .await
+        }));
         main_loop_state.update_mempool_receiver = update_receiver;
     }
 
@@ -1603,36 +1644,30 @@ impl MainLoopHandler {
 
             // Monitor for SIGTERM
             let mut sigterm = signal(SignalKind::terminate())?;
-            tokio::task::Builder::new()
-                .name("sigterm_handler")
-                .spawn(async move {
-                    if sigterm.recv().await.is_some() {
-                        info!("Received SIGTERM");
-                        tx_term.send(()).await.unwrap();
-                    }
-                })?;
+            tokio::task::spawn(async move {
+                if sigterm.recv().await.is_some() {
+                    info!("Received SIGTERM");
+                    tx_term.send(()).await.unwrap();
+                }
+            });
 
             // Monitor for SIGINT
             let mut sigint = signal(SignalKind::interrupt())?;
-            tokio::task::Builder::new()
-                .name("sigint_handler")
-                .spawn(async move {
-                    if sigint.recv().await.is_some() {
-                        info!("Received SIGINT");
-                        tx_int.send(()).await.unwrap();
-                    }
-                })?;
+            tokio::task::spawn(async move {
+                if sigint.recv().await.is_some() {
+                    info!("Received SIGINT");
+                    tx_int.send(()).await.unwrap();
+                }
+            });
 
             // Monitor for SIGQUIT
             let mut sigquit = signal(SignalKind::quit())?;
-            tokio::task::Builder::new()
-                .name("sigquit_handler")
-                .spawn(async move {
-                    if sigquit.recv().await.is_some() {
-                        info!("Received SIGQUIT");
-                        tx_quit.send(()).await.unwrap();
-                    }
-                })?;
+            tokio::task::spawn(async move {
+                if sigquit.recv().await.is_some() {
+                    info!("Received SIGQUIT");
+                    tx_quit.send(()).await.unwrap();
+                }
+            });
         }
 
         #[cfg(not(unix))]
@@ -1670,9 +1705,7 @@ impl MainLoopHandler {
                     let peer_task_to_main_tx_clone: mpsc::Sender<PeerTaskToMain> = self.peer_task_to_main_tx.clone();
                     let own_handshake_data: HandshakeData = state.get_own_handshakedata();
                     let global_state_lock = self.global_state_lock.clone(); // bump arc refcount.
-                    let incoming_peer_task_handle = tokio::task::Builder::new()
-                        .name("answer_peer_wrapper")
-                        .spawn(async move {
+                    let incoming_peer_task_handle = tokio::task::spawn(async move {
                         match answer_peer(
                             stream,
                             global_state_lock,
@@ -1684,7 +1717,7 @@ impl MainLoopHandler {
                             Ok(()) => (),
                             Err(err) => debug!("Got result: {:?}", err),
                         }
-                    })?;
+                    });
                     main_loop_state.task_handles.push(incoming_peer_task_handle);
                     main_loop_state.task_handles.retain(|th| !th.is_finished());
                 }
@@ -1860,9 +1893,7 @@ impl MainLoopHandler {
 
                     let global_state_lock_clone = self.global_state_lock.clone();
                     let main_to_peer_broadcast_tx_clone = self.main_to_peer_broadcast_tx.clone();
-                    let _proof_upgrader_task = tokio::task::Builder::new()
-                        .name("proof_upgrader")
-                        .spawn(async move {
+                    let _proof_upgrader_task = tokio::task::spawn(async move {
                         upgrade_job
                             .handle_upgrade(
                                 vm_job_queue.clone(),
@@ -1870,7 +1901,7 @@ impl MainLoopHandler {
                                 main_to_peer_broadcast_tx_clone,
                             )
                             .await
-                    })?;
+                    });
 
                     // main_loop_state.proof_upgrader_task = Some(proof_upgrader_task);
                     // If transaction could not be shared immediately because
@@ -1888,17 +1919,15 @@ impl MainLoopHandler {
                     "Attempting to upgrade transactions: {}",
                     upgrade_job.affected_txids().iter().join(", ")
                 );
-                tokio::task::Builder::new()
-                    .name("proof_upgrader")
-                    .spawn(async move {
-                        upgrade_job
-                            .handle_upgrade(
-                                vm_job_queue,
-                                global_state_lock_clone,
-                                main_to_peer_broadcast_tx_clone,
-                            )
-                            .await
-                    })?;
+                tokio::task::spawn(async move {
+                    upgrade_job
+                        .handle_upgrade(
+                            vm_job_queue,
+                            global_state_lock_clone,
+                            main_to_peer_broadcast_tx_clone,
+                        )
+                        .await
+                });
 
                 Ok(false)
             }
@@ -1938,15 +1967,17 @@ impl MainLoopHandler {
             RPCServerToMain::SetTipToStoredBlock(digest) => {
                 info!("setting tip to {digest:x}");
 
-                if let Err(e) = self
+                let block_notify = self.global_state_lock.cli().block_notify.clone();
+                let res = self
                     .global_state_lock()
                     .lock_guard_mut()
                     .await
                     .set_tip_to_stored_block(digest)
-                    .await
-                {
-                    error!("Failed to set tip to {digest:x}: {e}");
-                }
+                    .await;
+                match res {
+                    Ok(_) => Self::spawn_block_notify_command(&block_notify, digest),
+                    Err(e) => error!("Failed to set tip to {digest:x}: {e}"),
+                };
 
                 Ok(false)
             }
@@ -2204,11 +2235,10 @@ mod tests {
     }
 
     mod update_mempool_txs {
-        use crate::api::export::NativeCurrencyAmount;
-        use crate::tests::shared::blocks::fake_deterministic_successor;
-        use crate::tests::shared::mock_tx::genesis_tx_with_proof_type;
-
         use super::*;
+        use crate::api::export::NativeCurrencyAmount;
+        use crate::tests::shared::blocks::fake_valid_deterministic_successor;
+        use crate::tests::shared::mock_tx::genesis_tx_with_proof_type;
 
         #[traced_test]
         #[apply(shared_tokio_runtime)]
@@ -2222,7 +2252,7 @@ mod tests {
             let fee = NativeCurrencyAmount::coins(1);
 
             let genesis_block = Block::genesis(network);
-            let block1 = fake_deterministic_successor(&genesis_block, network).await;
+            let block1 = fake_valid_deterministic_successor(&genesis_block, network).await;
             let cli = cli_args::Args {
                 tx_proving_capability: Some(TxProvingCapability::SingleProof),
                 ..Default::default()
@@ -3017,24 +3047,21 @@ mod tests {
             let peer_to_main_tx_clone = main_loop_handler.peer_task_to_main_tx.clone();
             let global_state_lock_clone = main_loop_handler.global_state_lock.clone();
             let (_main_to_peer_tx_mock, main_to_peer_rx_mock) = tokio::sync::broadcast::channel(10);
-            let incoming_peer_task_handle = tokio::task::Builder::new()
-                .name("answer_peer_wrapper")
-                .spawn(async move {
-                    match answer_peer(
-                        mock_stream,
-                        global_state_lock_clone,
-                        peer_socket_address,
-                        main_to_peer_rx_mock,
-                        peer_to_main_tx_clone,
-                        own_handshake,
-                    )
-                    .await
-                    {
-                        Ok(()) => (),
-                        Err(err) => debug!("Got result: {:?}", err),
-                    }
-                })
-                .unwrap();
+            let incoming_peer_task_handle = tokio::task::spawn(async move {
+                match answer_peer(
+                    mock_stream,
+                    global_state_lock_clone,
+                    peer_socket_address,
+                    main_to_peer_rx_mock,
+                    peer_to_main_tx_clone,
+                    own_handshake,
+                )
+                .await
+                {
+                    Ok(()) => (),
+                    Err(err) => debug!("Got result: {:?}", err),
+                }
+            });
 
             // `answer_peer_wrapper` should send a
             // `DisconnectFromLongestLivedPeer` message to main
@@ -3067,6 +3094,64 @@ mod tests {
 
             // don't forget to terminate the peer task, which is still running
             incoming_peer_task_handle.abort();
+        }
+    }
+
+    mod peer_messages {
+
+        use super::*;
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn new_block_from_peer_invokes_block_notify() {
+            use std::fs;
+
+            use crate::tests::shared::files::test_helper_data_dir;
+            use crate::tests::shared::files::unit_test_data_directory;
+            use crate::tests::shared::files::wait_for_file_to_exist;
+
+            const BLOCK_NOTIFY_SHELL_SCRIPT_NAME: &str = "block_notify_dummy.py";
+
+            let network = Network::Main;
+            let dummy_block = invalid_empty_block(&Block::genesis(network), network);
+            let block_hash = dummy_block.hash();
+            let tmp_dir = unit_test_data_directory(network).unwrap().root_dir_path();
+            let mut expected_file_location = tmp_dir.clone();
+            expected_file_location.push(block_hash.to_hex());
+            expected_file_location.set_extension("block");
+
+            // On receival of a new block: Call a script creating an empty file
+            // using the block hash as the file name. The test data directory
+            // must contain this shell script for this test to work.
+            let test_data_directory = test_helper_data_dir();
+            let cli = cli_args::Args {
+                block_notify: Some(format!(
+                    "{}{BLOCK_NOTIFY_SHELL_SCRIPT_NAME} %s {}",
+                    test_data_directory.to_string_lossy(),
+                    tmp_dir.to_string_lossy()
+                )),
+                network,
+                ..Default::default()
+            };
+
+            let incoming_connections = 0;
+            let outgoing_connections = 0;
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(incoming_connections, outgoing_connections, cli).await;
+            let mut mutable_main_loop_state = main_loop_handler.mutable();
+
+            let msg = PeerTaskToMain::NewBlocks(vec![dummy_block]);
+            main_loop_handler
+                .handle_peer_task_message(msg, &mut mutable_main_loop_state)
+                .await
+                .unwrap();
+
+            wait_for_file_to_exist(&expected_file_location)
+                .await
+                .unwrap();
+            let _ = fs::remove_file(&expected_file_location);
         }
     }
 }
