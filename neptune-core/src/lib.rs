@@ -71,6 +71,7 @@ use tracing::info;
 use triton_vm::prelude::BFieldElement;
 
 use crate::application::config::data_directory::DataDirectory;
+use crate::application::json_rpc::server::server::RpcServer;
 use crate::application::locks::tokio as sync_tokio;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
@@ -282,6 +283,14 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
     });
     task_join_handles.push(rpc_join_handle);
     info!("Started RPC server");
+
+    let rpc_state_lock = global_state_lock.clone();
+    let rpc_join_handle = tokio::spawn(async move {
+        let rpc_server = RpcServer::new(rpc_state_lock);
+        rpc_server.serve().await;
+    });
+    task_join_handles.push(rpc_join_handle);
+    info!("Started HTTP/JSON RPC server.");
 
     // Handle incoming connections, messages from peer tasks, and messages from the mining task
     Ok(MainLoopHandler::new(
