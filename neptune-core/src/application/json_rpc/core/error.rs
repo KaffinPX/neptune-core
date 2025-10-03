@@ -25,7 +25,7 @@ impl RpcError {
         match self {
             Self::ParseError => "Parse error",
             Self::InvalidRequest => "Invalid Request",
-            Self::MethodNotFound => "Method not found",
+            Self::MethodNotFound => "Method not found/unavailable",
             Self::InvalidParams => "Invalid params",
             Self::InternalError => "Internal error",
         }

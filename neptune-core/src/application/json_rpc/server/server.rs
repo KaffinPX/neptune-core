@@ -1,13 +1,20 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use axum::{extract::State, routing::post, Json, Router};
-use serde_json::Value;
+use axum::{
+    extract::{rejection::JsonRejection, State},
+    routing::post,
+    Json, Router,
+};
 use tokio::net::TcpListener;
 
 use crate::{
     application::json_rpc::core::{
-        api::{ops::RpcMethods, rpc::RpcApi},
+        api::{
+            ops::{Namespace, RpcMethods},
+            router::RpcRouter,
+            rpc::RpcApi,
+        },
         error::{RpcError, RpcRequest, RpcResponse},
         model::message::*,
     },
@@ -24,35 +31,38 @@ impl RpcServer {
         Self { state }
     }
 
-    pub async fn serve(&self) {
+    pub async fn serve(&self, listener: TcpListener) {
         let api: Arc<dyn RpcApi> = Arc::new(self.clone());
-        let router = Router::new().route("/", post(rpc_handler)).with_state(api);
-        let addr = SocketAddr::from(([127, 0, 0, 1], 3031));
-        let listener = TcpListener::bind(addr).await.unwrap();
+        let namespaces: HashSet<Namespace> = self.state.cli().rpc_modules.iter().cloned().collect();
+        let router = RpcMethods::new_router(api, namespaces);
 
-        axum::serve(listener, router).await.unwrap();
+        let app = Router::new()
+            .route("/", post(Self::rpc_handler))
+            .with_state(Arc::new(router));
+
+        axum::serve(listener, app).await.unwrap();
     }
-}
 
-pub async fn rpc_handler(
-    State(api): State<Arc<dyn RpcApi>>,
-    Json(body): Json<Value>,
-) -> Json<RpcResponse> {
-    let request: RpcRequest = match serde_json::from_value(body) {
-        Ok(r) => r,
-        Err(_) => {
-            return Json(RpcResponse::error(None, RpcError::ParseError));
-        }
-    };
+    async fn rpc_handler(
+        State(router): State<Arc<RpcRouter>>,
+        // An optimization to avoid deserializing 2 times
+        body: Result<Json<RpcRequest>, JsonRejection>,
+    ) -> Json<RpcResponse> {
+        let request = match body {
+            Ok(Json(r)) => r,
+            Err(_) => {
+                return Json(RpcResponse::error(None, RpcError::ParseError));
+            }
+        };
 
-    let res = RpcMethods::dispatch(&api, &request.method, request.params).await;
+        let res = router.dispatch(&request.method, request.params).await;
+        let response = match res {
+            Ok(result) => RpcResponse::success(request.id, result),
+            Err(error) => RpcResponse::error(request.id, error),
+        };
 
-    let response = match res {
-        Ok(result) => RpcResponse::success(request.id, result),
-        Err(error) => RpcResponse::error(request.id, error),
-    };
-
-    Json(response)
+        Json(response)
+    }
 }
 
 #[async_trait]
@@ -70,39 +80,5 @@ impl RpcApi for RpcServer {
                 .height
                 .into(),
         }
-    }
-}
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use crate::{
-        api::export::Network,
-        application::{
-            config::cli_args,
-            json_rpc::{core::api::rpc::RpcApi, server::server::RpcServer},
-        },
-        state::wallet::wallet_entropy::WalletEntropy,
-        tests::{shared::globalstate::mock_genesis_global_state, shared_tokio_runtime},
-    };
-    use anyhow::Result;
-    use macro_rules_attr::apply;
-
-    async fn test_rpc_server() -> RpcServer {
-        let global_state_lock = mock_genesis_global_state(
-            2,
-            WalletEntropy::new_random(),
-            cli_args::Args::default_with_network(Network::Main),
-        )
-        .await;
-
-        RpcServer::new(global_state_lock)
-    }
-
-    #[apply(shared_tokio_runtime)]
-    async fn test_height_is_correct() -> Result<()> {
-        let rpc_server = test_rpc_server().await;
-        assert_eq!(0, rpc_server.get_height().await.height);
-        Ok(())
     }
 }

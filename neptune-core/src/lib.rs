@@ -284,13 +284,18 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
     task_join_handles.push(rpc_join_handle);
     info!("Started RPC server");
 
-    let rpc_state_lock = global_state_lock.clone();
-    let rpc_join_handle = tokio::spawn(async move {
-        let rpc_server = RpcServer::new(rpc_state_lock);
-        rpc_server.serve().await;
-    });
-    task_join_handles.push(rpc_join_handle);
-    info!("Started HTTP/JSON RPC server.");
+    if let Some(addr) = global_state_lock.cli().listen_rpc {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let rpc_state_lock = global_state_lock.clone();
+
+        let rpc_join_handle = tokio::spawn(async move {
+            let rpc_server = RpcServer::new(rpc_state_lock);
+            rpc_server.serve(listener).await;
+        });
+        task_join_handles.push(rpc_join_handle);
+
+        info!("Started HTTP/JSON RPC server.");
+    }
 
     // Handle incoming connections, messages from peer tasks, and messages from the mining task
     Ok(MainLoopHandler::new(
